@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Messenger Pro</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root { --primary: #0088cc; --bg: #f0f2f5; --my-msg: #e3f2fd; }
+        body { font-family: 'Segoe UI', sans-serif; margin: 0; background: var(--bg); height: 100vh; display: flex; overflow: hidden; }
+        #auth-screen { position: fixed; inset: 0; background: rgba(0,0,0,0.5); backdrop-filter: blur(5px); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+        .auth-card { background: white; padding: 40px; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; width: 300px; }
+        .auth-card input { width: 90%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 10px; outline: none; }
+        .btn-primary { background: var(--primary); color: white; border: none; padding: 12px 24px; border-radius: 10px; cursor: pointer; font-weight: bold; width: 100%; }
+
+        #app-interface { display: none; width: 100%; height: 100%; max-width: 1200px; margin: 0 auto; background: white; box-shadow: 0 0 20px rgba(0,0,0,0.05); }
+        .sidebar { width: 320px; border-right: 1px solid #eee; display: flex; flex-direction: column; background: white; }
+        .sidebar-header { padding: 20px; background: #f8f9fa; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        .contact-list { flex: 1; overflow-y: auto; }
+        .contact-item { padding: 15px 20px; display: flex; align-items: center; gap: 15px; cursor: pointer; transition: 0.2s; border-bottom: 1px solid #f5f5f5; }
+        .contact-item:hover { background: #f8f9fa; }
+        .avatar { width: 45px; height: 45px; background: #ddd; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; color: #555; }
+
+        .chat-area { flex: 1; display: flex; flex-direction: column; background: #efe7dd; position: relative; }
+        .chat-header { padding: 15px 20px; background: white; border-bottom: 1px solid #eee; display: flex; align-items: center; gap: 15px; font-weight: bold; color: #333; }
+        .messages-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 10px; background-color: #efe7dd; }
+
+        #typing-status { font-size: 0.8em; color: #0088cc; height: 15px; opacity: 0; transition: opacity 0.3s; font-style: italic; margin-top: 2px; }
+
+        .msg-wrapper { display: flex; flex-direction: column; max-width: 65%; animation: fadeIn 0.3s ease; position: relative; }
+        .msg-wrapper.my { align-self: flex-end; align-items: flex-end; }
+        .msg-wrapper.other { align-self: flex-start; align-items: flex-start; }
+        .msg-bubble { padding: 10px 15px; border-radius: 12px; position: relative; box-shadow: 0 1px 2px rgba(0,0,0,0.1); font-size: 15px; line-height: 1.4; word-wrap: break-word; }
+        .my .msg-bubble { background: var(--my-msg); border-bottom-right-radius: 2px; }
+        .other .msg-bubble { background: white; border-bottom-left-radius: 2px; }
+
+        .reaction-badge {
+            position: absolute; bottom: -10px; right: 0; background: white; border-radius: 10px;
+            padding: 2px 6px; font-size: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+            display: none; border: 1px solid #eee;
+        }
+
+        .msg-img { max-width: 100%; max-height: 300px; border-radius: 8px; margin-top: 5px; cursor: pointer; display: block; object-fit: contain; }
+        .msg-audio { margin-top: 5px; outline: none; }
+        .msg-time { font-size: 0.7em; color: #999; text-align: right; margin-top: 4px; }
+        .msg-status { font-size: 0.7em; margin-left: 5px; vertical-align: middle; }
+        .status-sent { color: #999; }
+        .status-read { color: #4fc3f7; }
+
+        .input-area { padding: 15px; background: white; display: flex; flex-direction: column; align-items: stretch; gap: 10px; border-top: 1px solid #eee; }
+        .attach-btn, .mic-btn { background: none; border: none; font-size: 20px; color: #777; cursor: pointer; transition: 0.2s; }
+        .mic-btn.recording { color: #ff4d4d; animation: pulse 1.5s infinite; }
+        #msg-input { flex: 1; padding: 12px 15px; border: 1px solid #ddd; border-radius: 20px; outline: none; }
+        .send-btn { background: var(--primary); color: white; border: none; width: 45px; height: 45px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.2); } 100% { transform: scale(1); } }
+        #file-input { display: none; }
+    </style>
+</head>
+<body>
+
+<div id="auth-screen">
+    <div class="auth-card">
+        <h2>Messenger</h2>
+        <input type="text" id="username" placeholder="Имя">
+        <input type="password" id="password" placeholder="Пароль">
+        <button class="btn-primary" onclick="login()">Войти</button>
+    </div>
+</div>
+
+<div id="app-interface">
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <span>Чаты</span>
+            <button onclick="logout()" style="background:none; border:none; color:#ff4d4d; cursor:pointer;"><i
+                    class="fas fa-sign-out-alt"></i></button>
+        </div>
+        <div class="contact-list" id="contact-list"></div>
+        <div style="padding: 15px; border-top: 1px solid #eee;">
+            <div style="display:flex; gap:5px;">
+                <input type="text" id="new-chat-input" placeholder="Новый контакт..."
+                       style="flex:1; padding:8px; border:1px solid #ddd; border-radius:5px;">
+                <button onclick="startNewChat()"
+                        style="background:var(--primary); color:white; border:none; border-radius:5px; width:35px; cursor:pointer;">
+                    +
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="chat-area">
+        <div class="chat-header">
+            <div class="avatar" id="header-avatar">?</div>
+            <div style="display: flex; flex-direction: column;">
+                <span id="header-name">Выберите чат</span>
+                <span id="typing-status">печатает...</span>
+            </div>
+        </div>
+
+        <div class="messages-container" id="messages-container">
+            <div class="no-chat-selected" style="text-align:center; color:#888; margin-top:50px;">Выберите чат</div>
+        </div>
+
+        <div class="input-area" id="input-area" style="display:none;">
+            <div id="reply-panel"
+                 style="display: none; background: #f0f2f5; padding: 8px; border-left: 4px solid var(--primary); position: relative;">
+                <span style="font-size: 0.8em; color: var(--primary); font-weight: bold;">Ответ на сообщение</span>
+                <div id="reply-text-preview"
+                     style="font-size: 0.9em; color: #555; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+                <button onclick="cancelReply()"
+                        style="position: absolute; right: 5px; top: 5px; background: none; border: none; cursor: pointer; color: #777;">
+                    <i class="fas fa-times"></i></button>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <input type="file" id="file-input" onchange="handleFileSelect(this)">
+                <button class="attach-btn" onclick="document.getElementById('file-input').click()"><i
+                        class="fas fa-paperclip"></i></button>
+                <button class="mic-btn" id="mic-btn" onclick="toggleRecording()"><i class="fas fa-microphone"></i>
+                </button>
+                <input type="text" id="msg-input" placeholder="Сообщение...">
+                <button id="silent-btn" onclick="toggleSilent()"
+                        style="background: none; border: none; color: #ccc; cursor: pointer; font-size: 1.2em;"
+                        title="Отправить без звука"><i class="fas fa-bell-slash"></i></button>
+                <button class="send-btn" onclick="sendTextMsg()"><i class="fas fa-paper-plane"></i></button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let currentUser = localStorage.getItem('username') || "";
+    let socket;
+    let activeChatId = null;
+    let messageElements = {};
+    let mediaRecorder;
+    let audioChunks = [];
+    let isRecording = false;
+    let typingTimeout;
+    let replyToId = null;
+    let isSilent = false;
+
+    // Инициализация элементов DOM
+    const msgInput = document.getElementById('msg-input');
+    const contactList = document.getElementById('contact-list');
+    const messagesContainer = document.getElementById('messages-container');
+    const headerName = document.getElementById('header-name');
+    const headerAvatar = document.getElementById('header-avatar');
+    const inputArea = document.getElementById('input-area');
+    const typingStatus = document.getElementById('typing-status');
+    const replyPanel = document.getElementById('reply-panel');
+    const replyTextPreview = document.getElementById('reply-text-preview');
+    const silentBtn = document.getElementById('silent-btn');
+    const micBtn = document.getElementById('mic-btn');
+    const fileInput = document.getElementById('file-input');
+
+    window.onload = () => { if(currentUser) initApp(); };
+
+    async function login() {
+        const u = document.getElementById('username').value;
+        const p = document.getElementById('password').value;
+        if(!u || !p) return alert("Введите имя и пароль");
+        let fd = new FormData(); fd.append('username', u); fd.append('password', p);
+        try {
+            let r = await fetch('/token', { method:'POST', body:fd });
+            if(r.status === 401) {
+                const reg = await fetch('/register', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:u, password:p, display_name: u}) });
+                if(!reg.ok) throw new Error("Ошибка регистрации");
+                r = await fetch('/token', { method:'POST', body:fd });
+            }
+            if(!r.ok) throw new Error("Ошибка входа");
+            const data = await r.json();
+            localStorage.setItem('username', u);
+            localStorage.setItem('token', data.access_token);
+            currentUser = u;
+            initApp();
+        } catch(e) { console.error(e); alert("Ошибка: " + e.message); }
+    }
+
+    function initApp() {
+        document.getElementById('auth-screen').style.display = 'none';
+        document.getElementById('app-interface').style.display = 'flex';
+        loadChats();
+    }
+
+    async function loadChats() {
+        try {
+            const response = await fetch('/chats/list', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ my_username: currentUser }) });
+            if (!response.ok) throw new Error("Ошибка сети");
+            const chats = await response.json();
+            contactList.innerHTML = '';
+            if (!Array.isArray(chats)) return;
+            chats.forEach(chat => {
+                const div = document.createElement('div');
+                div.className = 'contact-item';
+                div.onclick = () => openChat(chat.chat_id, chat.partner_name);
+                const initial = chat.partner_name ? chat.partner_name[0].toUpperCase() : '?';
+                div.innerHTML = `<div class="avatar">${initial}</div><div style="flex:1;"><div style="font-weight:bold;">${chat.partner_name}</div><div style="font-size:0.8em; color:#888;">${chat.last_message || 'Нет сообщений'}</div></div>`;
+                contactList.appendChild(div);
+            });
+        } catch (e) { console.error("Network error:", e); }
+    }
+
+    async function startNewChat() {
+        const p = document.getElementById('new-chat-input').value.trim();
+        if(!p) return;
+        if(p === currentUser) { alert("Нельзя создать чат с самим собой!"); return; }
+        try {
+            const r = await fetch('/chats/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({my_username:currentUser, partner_username:p}) });
+            if(r.ok) {
+                const data = await r.json();
+                document.getElementById('new-chat-input').value='';
+                loadChats();
+                openChat(data.chat_id, p);
+            } else {
+                const err = await r.json();
+                alert(err.detail || "Ошибка создания чата");
+            }
+        } catch (e) { alert("Ошибка сети"); }
+    }
+
+    async function openChat(id, name) {
+        activeChatId = id;
+        headerName.textContent = name;
+        headerAvatar.textContent = name ? name[0].toUpperCase() : '?';
+        inputArea.style.display = 'flex';
+        messagesContainer.innerHTML = '';
+        messageElements = {};
+        cancelReply();
+        if(socket) socket.close();
+
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${id}`);
+
+        socket.onopen = () => {
+            console.log("✅ WS Connected");
+            socket.send(JSON.stringify({ type: "read_receipt", sender: currentUser }));
+        };
+
+        socket.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            if (data.type === "typing") {
+                if (data.sender !== currentUser) {
+                    typingStatus.textContent = `${data.sender} печатает...`;
+                    typingStatus.style.opacity = '1';
+                    clearTimeout(typingTimeout);
+                    typingTimeout = setTimeout(() => { typingStatus.style.opacity = '0'; }, 3000);
+                }
+                return;
+            }
+            if (data.type === "reaction_update") { updateMessageReaction(data.msg_id, data.sender, data.emoji); return; }
+            if (data.type === "bulk_read_update") { markAllAsReadUI(); return; }
+            renderMessage(data);
+        };
+
+        socket.onclose = () => console.warn("WS Closed");
+        socket.onerror = (err) => console.error("WS Error", err);
+    }
+
+    function sendTextMsg() {
+        const text = msgInput.value.trim();
+        if ((!text && !replyToId) || !activeChatId) return;
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({
+                type: "message", text: text, file_url: "",
+                sender: currentUser, reply_to_id: replyToId, is_silent: isSilent
+            }));
+            msgInput.value = '';
+            cancelReply();
+            if(isSilent) toggleSilent();
+        } else {
+            console.error("Socket not ready");
+        }
+    }
+
+    // Исправлено: теперь msgInput уже определен выше
+    msgInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendTextMsg(); });
+
+    msgInput.addEventListener('input', () => {
+        if (socket && socket.readyState === WebSocket.OPEN && activeChatId) {
+            socket.send(JSON.stringify({ type: "typing", sender: currentUser }));
+        }
+    });
+
+    function setReply(msgId, text) {
+        replyToId = msgId;
+        replyPanel.style.display = 'block';
+        replyTextPreview.textContent = text || "Медиафайл";
+        msgInput.focus();
+    }
+    function cancelReply() {
+        replyToId = null;
+        replyPanel.style.display = 'none';
+    }
+    function toggleSilent() {
+        isSilent = !isSilent;
+        silentBtn.style.color = isSilent ? '#0088cc' : '#ccc';
+    }
+
+    async function handleFileSelect(input) {
+        const file = input.files[0];
+        if (!file || !activeChatId) return;
+        const formData = new FormData();
+        formData.append("file", file);
+        try {
+            const res = await fetch('/upload', { method: 'POST', body: formData });
+            if (!res.ok) throw new Error("Upload failed");
+            const data = await res.json();
+            socket.send(JSON.stringify({ type: "message", text: "", file_url: data.file_url, sender: currentUser, reply_to_id: replyToId, is_silent: isSilent }));
+            cancelReply();
+        } catch (err) { alert("Ошибка отправки: " + err.message); }
+        input.value = '';
+    }
+
+    async function toggleRecording() {
+        if (!isRecording) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                mediaRecorder.ondataavailable = event => { audioChunks.push(event.data); };
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const audioFile = new File([audioBlob], "voice.webm", { type: "audio/webm" });
+                    handleFileSelect({ files: [audioFile] });
+                };
+                mediaRecorder.start();
+                isRecording = true;
+                micBtn.classList.add('recording');
+            } catch (err) { alert("Нет доступа к микрофону"); }
+        } else {
+            mediaRecorder.stop();
+            isRecording = false;
+            micBtn.classList.remove('recording');
+        }
+    }
+
+    function renderMessage(msg) {
+        if (!msg.text && !msg.file_url && msg.type !== 'reaction_update') return;
+        const placeholder = messagesContainer.querySelector('.no-chat-selected');
+        if (placeholder) placeholder.remove();
+
+        const wrapper = document.createElement('div');
+        wrapper.className = `msg-wrapper ${msg.sender === currentUser ? 'my' : 'other'}`;
+        if (msg.id) wrapper.id = `msg-${msg.id}`;
+
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble';
+        bubble.ondblclick = () => { if (msg.id && socket) socket.send(JSON.stringify({ type: "reaction", msg_id: msg.id, emoji: "❤️", sender: currentUser })); };
+        bubble.oncontextmenu = (e) => { e.preventDefault(); setReply(msg.id, msg.text); };
+
+        if (msg.reply_to_id && msg.reply_text) {
+            const replyDiv = document.createElement('div');
+            replyDiv.style.cssText = "font-size:0.85em; color:#0088cc; margin-bottom:4px; border-left:2px solid #0088cc; padding-left:5px; cursor:pointer;";
+            replyDiv.innerHTML = `<i class="fas fa-reply"></i> ${msg.reply_text.substring(0, 30)}...`;
+            replyDiv.onclick = () => { const t = document.getElementById(`msg-${msg.reply_to_id}`); if(t) t.scrollIntoView({behavior:"smooth", block:"center"}); };
+            bubble.appendChild(replyDiv);
+        }
+
+        if (msg.text) { const p = document.createElement('div'); p.textContent = msg.text; bubble.appendChild(p); }
+        if (msg.file_url) {
+            let fullUrl = msg.file_url.startsWith('/') ? window.location.origin + msg.file_url : msg.file_url;
+            if (fullUrl.match(/\.(webm|mp3|wav)$/i)) {
+                const audio = document.createElement('audio'); audio.src = fullUrl; audio.controls = true; audio.className = 'msg-audio'; bubble.appendChild(audio);
+            } else {
+                const img = document.createElement('img'); img.src = fullUrl; img.className = 'msg-img'; img.onclick = () => window.open(fullUrl, '_blank'); bubble.appendChild(img);
+            }
+        }
+
+        const metaDiv = document.createElement('div');
+        metaDiv.style.cssText = "display:flex; justify-content:flex-end; align-items:center; gap:5px; margin-top:4px;";
+        if (msg.is_silent) { const i = document.createElement('i'); i.className = 'fas fa-bell-slash'; i.style.cssText = "font-size:0.7em; color:#999;"; metaDiv.appendChild(i); }
+        const time = document.createElement('span'); time.className = 'msg-time'; time.textContent = msg.time; metaDiv.appendChild(time);
+
+        if (msg.sender === currentUser && msg.id) {
+            const statusSpan = document.createElement('span');
+            statusSpan.className = `msg-status ${msg.is_read ? 'status-read' : 'status-sent'}`;
+            statusSpan.innerHTML = msg.is_read ? '&#10003;&#10003;' : '&#10003;';
+            metaDiv.appendChild(statusSpan);
+            messageElements[msg.id] = statusSpan;
+        }
+        bubble.appendChild(metaDiv);
+        wrapper.appendChild(bubble);
+        messagesContainer.appendChild(wrapper);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+
+    function updateMessageReaction(msgId, sender, emoji) {
+        const w = document.getElementById(`msg-${msgId}`);
+        if (w) {
+            let badge = w.querySelector('.reaction-badge');
+            if (!badge) { badge = document.createElement('div'); badge.className = 'reaction-badge'; w.querySelector('.msg-bubble').appendChild(badge); }
+            badge.textContent = emoji; badge.style.display = 'block';
+        }
+    }
+    function markAllAsReadUI() {
+        for (const id in messageElements) {
+            const el = messageElements[id];
+            if (el) { el.className = 'msg-status status-read'; el.innerHTML = '&#10003;&#10003;'; }
+        }
+    }
+    function logout() { localStorage.clear(); location.reload(); }
+</script>
+</body>
+</html>

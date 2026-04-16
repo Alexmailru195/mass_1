@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package messenger;
+
+message ChatMessage {
+    int32 id = 1;
+    string text = 2;
+    string file_url = 3;
+    string sender = 4;
+    string time = 5;
+    bool is_read = 6;
+    MessageType type = 7;
+}
+
+enum MessageType {
+    TEXT = 0;
+    READ_UPDATE = 1;
+    BULK_READ_UPDATE = 2;
+}
