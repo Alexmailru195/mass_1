@@ -46,23 +46,20 @@ class Message(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     text = Column(Text, nullable=True)
-    file_url = Column(String, nullable=True)  # Ссылка на файл/видео в MinIO
-    file_type = Column(String, nullable=True)  # 'image', 'video', 'document'
+    file_url = Column(String, nullable=True)
+    file_type = Column(String, nullable=True)
 
     sender_id = Column(Integer, ForeignKey("users.id"))
     chat_id = Column(Integer, ForeignKey("chats.id"))
 
-    # Для ответов (Reply)
-    reply_to_id = Column(Integer, nullable=True)  # ID сообщения, на которое ответили
-
-    # Для редактирования
+    reply_to_id = Column(Integer, nullable=True)
     is_edited = Column(Boolean, default=False)
     edited_at = Column(DateTime, nullable=True)
-
-    # Для самоудаления
-    expires_at = Column(DateTime, nullable=True)  # Когда сообщение должно удалиться
-
+    expires_at = Column(DateTime, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+    # ВАЖНО: Явно установи default=False
+    is_read = Column(Boolean, default=False)
 
     sender = relationship("User", back_populates="messages_sent")
     chat = relationship("Chat", back_populates="messages")

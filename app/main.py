@@ -5,7 +5,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime, timedelta
-import json, asyncio, os
+import json, asyncio, os, threading
 from uuid import uuid4
 
 from . import models, schemas, database, security, redis_client, s3_client, es_client
@@ -34,7 +34,6 @@ def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(models.User).filter(models.User.username == user.username).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Username already registered")
-
     hashed_password = security.get_password_hash(user.password)
     new_user = models.User(
         username=user.username,
@@ -95,7 +94,6 @@ def create_chat(chat_data: schemas.ChatCreate, current_user_id: int, db: Session
         ).first()
         if existing_chat:
             return existing_chat
-
     new_chat = models.Chat(name=chat_data.name, type=chat_data.type)
     db.add(new_chat)
     db.flush()
@@ -150,16 +148,42 @@ async def upload_file(file: UploadFile = File(...)):
     return {"file_url": file_url, "file_type": file_type}
 
 
-# --- ГЛАВНЫЙ ИСПРАВЛЕННЫЙ WEBSOCKET ---
 @app.websocket("/ws/{chat_id}")
 async def websocket_endpoint(websocket: WebSocket, chat_id: int):
     await websocket.accept()
     db = database.SessionLocal()
-    listener_task = None
-    pubsub = None
+
+    # Простая реализация без сложного threading/executor для начала,
+    # чтобы убедиться, что соединение держится.
+    # Для продакшена лучше использовать aioredis, но пока попробуем так.
+
+    pubsub = redis_client.client.pubsub()
+    pubsub.subscribe(f"chat_{chat_id}")
+
+    stop_listening = asyncio.Event()
+
+    async def listen_for_messages():
+        try:
+            while not stop_listening.is_set():
+                # Используем asyncio.to_thread (Python 3.9+) или run_in_executor
+                # Но сначала проверим, работает ли вообще подключение
+                message = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message and message['type'] == 'message':
+                    data = json.loads(message['data'])
+                    await websocket.send_json(data)
+                # Небольшая пауза, чтобы не грузить CPU
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            print(f"Redis Listener Error: {e}")
+        finally:
+            pubsub.unsubscribe(f"chat_{chat_id}")
+            pubsub.close()
+
+    # Запускаем слушатель
+    listener_task = asyncio.create_task(listen_for_messages())
 
     try:
-        # 1. Отправляем историю (ПРОСТОЙ ЦИКЛ)
+        # 1. История
         messages = db.query(models.Message).filter(models.Message.chat_id == chat_id).order_by(
             models.Message.id.asc()).all()
 
@@ -175,42 +199,32 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
                 "file_url": msg.file_url, "sender": sender_name,
                 "sender_id": msg.sender_id, "time": msg.timestamp.strftime("%H:%M"),
                 "reply_to_id": msg.reply_to_id, "reply_text": reply_text,
-                "is_edited": msg.is_edited
+                "is_edited": msg.is_edited, "is_read": msg.is_read
             })
 
-        # 2. Подписка на Redis (СТРОГО ПОСЛЕ ИСТОРИИ!)
-        pubsub = redis_client.client.pubsub()
-        await pubsub.subscribe(f"chat_{chat_id}")
-
-        async def redis_listener():
-            try:
-                while True:
-                    # Ждем сообщение с таймаутом, чтобы можно было прервать цикл при отключении
-                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                    if message:
-                        data = json.loads(message['data'])
-                        await websocket.send_json(data)
-            except Exception as e:
-                print(f"Redis listener error: {e}")
-            finally:
-                try:
-                    await pubsub.unsubscribe(f"chat_{chat_id}")
-                    await pubsub.close()
-                except:
-                    pass
-
-        listener_task = asyncio.create_task(redis_listener())
-
-        # 3. Обработка входящих сообщений
+        # 2. Прием сообщений
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type")
             sender_name = data.get("sender")
 
+            if msg_type == "read_receipt":
+                message_ids = data.get("message_ids", [])
+                r_chat_id = data.get("chat_id")
+                if message_ids and r_chat_id:
+                    db.query(models.Message).filter(
+                        models.Message.id.in_(message_ids),
+                        models.Message.chat_id == r_chat_id
+                    ).update({models.Message.is_read: True}, synchronize_session=False)
+                    db.commit()
+                    receipt_packet = {"type": "read_receipt", "sender": sender_name, "message_ids": message_ids,
+                                      "chat_id": r_chat_id}
+                    redis_client.publish(f"chat_{r_chat_id}", receipt_packet)
+                continue
+
             if sender_name:
                 sender_user = db.query(models.User).filter(models.User.username == sender_name).first()
-                if sender_user:
-                    redis_client.update_status(sender_user.id)
+                if sender_user: redis_client.update_status(sender_user.id)
 
             if msg_type == "message":
                 text = data.get("text")
@@ -223,7 +237,7 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
                 new_msg = models.Message(
                     text=text, file_url=file_url, sender_id=sender_id,
                     chat_id=chat_id, reply_to_id=reply_to_id,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.utcnow(), is_read=False
                 )
                 db.add(new_msg)
                 db.commit()
@@ -239,36 +253,32 @@ async def websocket_endpoint(websocket: WebSocket, chat_id: int):
                     "file_url": file_url, "sender": sender_name,
                     "sender_id": sender_id, "time": new_msg.timestamp.strftime("%H:%M"),
                     "reply_to_id": reply_to_id, "reply_text": reply_text,
-                    "is_edited": False
+                    "is_edited": False, "is_read": False
                 }
 
-                # Публикация
                 redis_client.publish(f"chat_{chat_id}", msg_packet)
-                print(f"✅ Published msg {new_msg.id} to chat_{chat_id}")
+                print(f"✅ Msg {new_msg.id} sent")
 
             elif msg_type == "typing":
                 redis_client.publish(f"chat_{chat_id}", {"type": "typing", "sender": sender_name})
             elif msg_type == "reaction":
-                redis_client.publish(f"chat_{chat_id}", {
-                    "type": "reaction_update", "msg_id": data.get("msg_id"),
-                    "sender": sender_name, "emoji": data.get("emoji")
-                })
+                redis_client.publish(f"chat_{chat_id}",
+                                     {"type": "reaction_update", "msg_id": data.get("msg_id"), "sender": sender_name,
+                                      "emoji": data.get("emoji")})
 
     except WebSocketDisconnect:
         print("Client disconnected")
     except Exception as e:
-        print(f"WS Error: {e}")
+        import traceback
+        print(f"❌ WS CRITICAL ERROR: {e}")
+        traceback.print_exc()
     finally:
+        stop_listening.set()
         if listener_task:
             listener_task.cancel()
             try:
                 await listener_task
             except asyncio.CancelledError:
-                pass
-        if pubsub:
-            try:
-                await pubsub.close()
-            except:
                 pass
         db.close()
 

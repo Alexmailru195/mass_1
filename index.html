@@ -17,9 +17,18 @@
         .sidebar { width: 320px; border-right: 1px solid #eee; display: flex; flex-direction: column; background: white; }
         .sidebar-header { padding: 20px; background: #f8f9fa; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
         .contact-list { flex: 1; overflow-y: auto; }
-        .contact-item { padding: 15px 20px; display: flex; align-items: center; gap: 15px; cursor: pointer; transition: 0.2s; border-bottom: 1px solid #f5f5f5; }
+        .contact-item { padding: 15px 20px; display: flex; align-items: center; gap: 15px; cursor: pointer; transition: 0.2s; border-bottom: 1px solid #f5f5f5; position: relative; }
         .contact-item:hover { background: #f8f9fa; }
+        .contact-item.active { background: #e3f2fd; border-left: 3px solid var(--primary); }
         .avatar { width: 45px; height: 45px; background: #ddd; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; color: #555; }
+
+        /* Бейдж непрочитанных */
+        .unread-badge {
+            position: absolute; right: 15px; top: 50%; transform: translateY(-50%);
+            background: var(--primary); color: white; font-size: 0.7em; font-weight: bold;
+            padding: 2px 8px; border-radius: 10px; min-width: 20px; text-align: center; display: none;
+        }
+        .contact-item.has-unread .unread-badge { display: block; }
 
         .chat-area { flex: 1; display: flex; flex-direction: column; background: #efe7dd; position: relative; }
         .chat-header { padding: 15px 20px; background: white; border-bottom: 1px solid #eee; display: flex; align-items: center; gap: 15px; font-weight: bold; color: #333; }
@@ -134,14 +143,12 @@
     let socket;
     let activeChatId = null;
     let messageElements = {};
-    let mediaRecorder;
-    let audioChunks = [];
-    let isRecording = false;
-    let typingTimeout;
-    let replyToId = null;
-    let isSilent = false;
+    let mediaRecorder, audioChunks = [], isRecording = false;
+    let typingTimeout, replyToId = null, isSilent = false;
+    let unreadCounts = {}; // { chat_id: count }
+    let readMessageIds = new Set(); // IDs сообщений, которые мы уже прочитали
 
-    // Инициализация элементов DOM
+    // DOM элементы
     const msgInput = document.getElementById('msg-input');
     const contactList = document.getElementById('contact-list');
     const messagesContainer = document.getElementById('messages-container');
@@ -153,74 +160,145 @@
     const replyTextPreview = document.getElementById('reply-text-preview');
     const silentBtn = document.getElementById('silent-btn');
     const micBtn = document.getElementById('mic-btn');
-    const fileInput = document.getElementById('file-input');
+
+    // === ЗВУК ===
+    function playNotificationSound() {
+        try {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContext) return;
+            const ctx = new AudioContext(), osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.type = 'sine'; osc.frequency.value = 800; gain.gain.value = 0.1;
+            osc.start(); setTimeout(() => { osc.stop(); ctx.close(); }, 150);
+        } catch(e) { console.log("🔇 Sound:", e); }
+    }
+    document.addEventListener('click', () => { playNotificationSound(); console.log("🔊 Audio unlocked"); }, { once: true });
+
+    // === УВЕДОМЛЕНИЯ ===
+    function showNotification(sender, text) {
+        if (Notification.permission === "granted") {
+            new Notification(`💬 ${sender}`, { body: text, icon: "https://cdn-icons-png.flaticon.com/512/1077/1077063.png" });
+        } else if (Notification.permission !== "denied") {
+            Notification.requestPermission().then(p => { if(p==="granted") new Notification(`💬 ${sender}`, { body: text }); });
+        }
+    }
+
+    // === СЧЕТЧИК НЕПРОЧИТАННЫХ ===
+    function updateUnreadBadge(chatId, increment = true) {
+        if (!chatId) return;
+        if (increment) {
+            unreadCounts[chatId] = (unreadCounts[chatId] || 0) + 1;
+        } else {
+            unreadCounts[chatId] = 0;
+        }
+        const item = document.querySelector(`.contact-item[data-chat-id="${chatId}"]`);
+        if (item) {
+            let badge = item.querySelector('.unread-badge');
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'unread-badge';
+                item.appendChild(badge);
+            }
+            const count = unreadCounts[chatId] || 0;
+            if (count > 0) {
+                badge.textContent = count > 99 ? '99+' : count;
+                item.classList.add('has-unread');
+            } else {
+                item.classList.remove('has-unread');
+            }
+        }
+        const total = Object.values(unreadCounts).reduce((a,b) => a + b, 0);
+        document.title = total > 0 ? `(${total}) Messenger Pro` : "Messenger Pro";
+    }
+
+    function clearUnreadForChat(chatId) {
+        if (!chatId) return;
+        unreadCounts[chatId] = 0;
+        updateUnreadBadge(chatId, false);
+    }
+
+    // === ОТПРАВКА СТАТУСА ПРОЧТЕНИЯ ===
+    function sendReadReceipt(chatId, messageIds) {
+        if (!socket || socket.readyState !== WebSocket.OPEN || !messageIds.length) return;
+        socket.send(JSON.stringify({
+            type: "read_receipt",
+            chat_id: chatId,
+            message_ids: messageIds,
+            sender: currentUser
+        }));
+    }
+
+    // === ОТМЕТКА СООБЩЕНИЙ КАК ПРОЧИТАННЫХ (визуально) ===
+    function markMessagesAsRead(messageIds) {
+        messageIds.forEach(id => {
+            if (readMessageIds.has(id)) return;
+            readMessageIds.add(id);
+            const statusEl = messageElements[id];
+            if (statusEl) {
+                statusEl.className = 'msg-status status-read';
+                statusEl.innerHTML = '&#10003;&#10003;'; // Двойная галочка
+            }
+        });
+    }
 
     window.onload = () => { if(currentUser) initApp(); };
 
     async function login() {
-        const u = document.getElementById('username').value;
-        const p = document.getElementById('password').value;
+        const u = document.getElementById('username').value, p = document.getElementById('password').value;
         if(!u || !p) return alert("Введите имя и пароль");
         let fd = new FormData(); fd.append('username', u); fd.append('password', p);
         try {
             let r = await fetch('/token', { method:'POST', body:fd });
             if(r.status === 401) {
-                const reg = await fetch('/register', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:u, password:p, display_name: u}) });
-                if(!reg.ok) throw new Error("Ошибка регистрации");
+                await fetch('/register', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:u, password:p, display_name: u}) });
                 r = await fetch('/token', { method:'POST', body:fd });
             }
             if(!r.ok) throw new Error("Ошибка входа");
             const data = await r.json();
-            localStorage.setItem('username', u);
-            localStorage.setItem('token', data.access_token);
-            currentUser = u;
-            initApp();
+            localStorage.setItem('username', u); localStorage.setItem('token', data.access_token);
+            currentUser = u; initApp();
         } catch(e) { console.error(e); alert("Ошибка: " + e.message); }
     }
 
     function initApp() {
         document.getElementById('auth-screen').style.display = 'none';
         document.getElementById('app-interface').style.display = 'flex';
+        if (Notification.permission !== "granted" && Notification.permission !== "denied") Notification.requestPermission();
         loadChats();
     }
 
     async function loadChats() {
         try {
-            const response = await fetch('/chats/list', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ my_username: currentUser }) });
-            if (!response.ok) throw new Error("Ошибка сети");
-            const chats = await response.json();
+            const res = await fetch('/chats/list', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({my_username: currentUser}) });
+            if(!res.ok) throw new Error("Ошибка сети");
+            const chats = await res.json();
             contactList.innerHTML = '';
-            if (!Array.isArray(chats)) return;
+            if(!Array.isArray(chats)) return;
             chats.forEach(chat => {
                 const div = document.createElement('div');
-                div.className = 'contact-item';
+                div.className = 'contact-item' + (chat.chat_id === activeChatId ? ' active' : '');
+                div.dataset.chatId = chat.chat_id;
                 div.onclick = () => openChat(chat.chat_id, chat.partner_name);
                 const initial = chat.partner_name ? chat.partner_name[0].toUpperCase() : '?';
-                div.innerHTML = `<div class="avatar">${initial}</div><div style="flex:1;"><div style="font-weight:bold;">${chat.partner_name}</div><div style="font-size:0.8em; color:#888;">${chat.last_message || 'Нет сообщений'}</div></div>`;
+                div.innerHTML = `<div class="avatar">${initial}</div><div style="flex:1;"><div style="font-weight:bold;">${chat.partner_name}</div><div style="font-size:0.8em; color:#888;">${chat.last_message || 'Нет сообщений'}</div></div><span class="unread-badge"></span>`;
                 contactList.appendChild(div);
+                if(unreadCounts[chat.chat_id] > 0) updateUnreadBadge(chat.chat_id, false);
             });
-        } catch (e) { console.error("Network error:", e); }
+        } catch(e) { console.error("Network error:", e); }
     }
 
     async function startNewChat() {
         const p = document.getElementById('new-chat-input').value.trim();
-        if(!p) return;
-        if(p === currentUser) { alert("Нельзя создать чат с самим собой!"); return; }
+        if(!p) return; if(p === currentUser) { alert("Нельзя создать чат с самим собой!"); return; }
         try {
             const r = await fetch('/chats/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({my_username:currentUser, partner_username:p}) });
-            if(r.ok) {
-                const data = await r.json();
-                document.getElementById('new-chat-input').value='';
-                loadChats();
-                openChat(data.chat_id, p);
-            } else {
-                const err = await r.json();
-                alert(err.detail || "Ошибка создания чата");
-            }
-        } catch (e) { alert("Ошибка сети"); }
+            if(r.ok) { const d = await r.json(); document.getElementById('new-chat-input').value=''; loadChats(); openChat(d.chat_id, p); }
+            else { const err = await r.json(); alert(err.detail || "Ошибка"); }
+        } catch(e) { alert("Ошибка сети"); }
     }
 
     async function openChat(id, name) {
+        clearUnreadForChat(id);
         activeChatId = id;
         headerName.textContent = name;
         headerAvatar.textContent = name ? name[0].toUpperCase() : '?';
@@ -228,20 +306,23 @@
         messagesContainer.innerHTML = '';
         messageElements = {};
         cancelReply();
+        document.querySelectorAll('.contact-item').forEach(el => el.classList.remove('active'));
+        const item = document.querySelector(`.contact-item[data-chat-id="${id}"]`);
+        if(item) item.classList.add('active');
         if(socket) socket.close();
-
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${id}`);
 
         socket.onopen = () => {
             console.log("✅ WS Connected");
-            socket.send(JSON.stringify({ type: "read_receipt", sender: currentUser }));
+            // Отправляем read_receipt при подключении
+            socket.send(JSON.stringify({ type: "read_receipt", chat_id: id, message_ids: [], sender: currentUser }));
         };
 
         socket.onmessage = (e) => {
             const data = JSON.parse(e.data);
-            if (data.type === "typing") {
-                if (data.sender !== currentUser) {
+            if(data.type === "typing") {
+                if(data.sender !== currentUser) {
                     typingStatus.textContent = `${data.sender} печатает...`;
                     typingStatus.style.opacity = '1';
                     clearTimeout(typingTimeout);
@@ -249,158 +330,150 @@
                 }
                 return;
             }
-            if (data.type === "reaction_update") { updateMessageReaction(data.msg_id, data.sender, data.emoji); return; }
-            if (data.type === "bulk_read_update") { markAllAsReadUI(); return; }
-            renderMessage(data);
-        };
+            if(data.type === "reaction_update") { updateMessageReaction(data.msg_id, data.sender, data.emoji); return; }
 
+            // Обработка read_receipt от других участников
+            if(data.type === "read_receipt" && data.sender !== currentUser) {
+                if(data.message_ids && data.message_ids.length) {
+                    markMessagesAsRead(data.message_ids);
+                }
+                return;
+            }
+
+            if(data.type === "message") {
+                renderMessage(data);
+                // === УМНЫЕ УВЕДОМЛЕНИЯ ===
+                if(data.sender !== currentUser) {
+                    const isInActiveChat = (activeChatId == data.chat_id);
+                    if(!isInActiveChat || document.hidden) {
+                        playNotificationSound();
+                        if(document.hidden) showNotification(data.sender, data.text || "Новое медиа");
+                        if(!isInActiveChat && data.chat_id) updateUnreadBadge(data.chat_id, true);
+                    }
+                    // Если чат активен — отправляем read_receipt
+                    if(isInActiveChat && data.id && !readMessageIds.has(data.id)) {
+                        markMessagesAsRead([data.id]);
+                        sendReadReceipt(data.chat_id, [data.id]);
+                    }
+                }
+            }
+        };
         socket.onclose = () => console.warn("WS Closed");
         socket.onerror = (err) => console.error("WS Error", err);
     }
 
     function sendTextMsg() {
         const text = msgInput.value.trim();
-        if ((!text && !replyToId) || !activeChatId) return;
-        if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({
-                type: "message", text: text, file_url: "",
-                sender: currentUser, reply_to_id: replyToId, is_silent: isSilent
-            }));
-            msgInput.value = '';
-            cancelReply();
-            if(isSilent) toggleSilent();
-        } else {
-            console.error("Socket not ready");
-        }
+        if((!text && !replyToId) || !activeChatId) return;
+        if(socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type:"message", text, file_url:"", sender:currentUser, reply_to_id:replyToId, is_silent:isSilent, chat_id:activeChatId }));
+            msgInput.value = ''; cancelReply(); if(isSilent) toggleSilent();
+        } else console.error("Socket not ready");
     }
-
-    // Исправлено: теперь msgInput уже определен выше
-    msgInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendTextMsg(); });
-
+    msgInput.addEventListener('keypress', e => { if(e.key === 'Enter') sendTextMsg(); });
     msgInput.addEventListener('input', () => {
-        if (socket && socket.readyState === WebSocket.OPEN && activeChatId) {
-            socket.send(JSON.stringify({ type: "typing", sender: currentUser }));
+        if(socket && socket.readyState === WebSocket.OPEN && activeChatId) {
+            socket.send(JSON.stringify({ type:"typing", sender:currentUser, chat_id:activeChatId }));
         }
     });
 
-    function setReply(msgId, text) {
-        replyToId = msgId;
-        replyPanel.style.display = 'block';
-        replyTextPreview.textContent = text || "Медиафайл";
-        msgInput.focus();
-    }
-    function cancelReply() {
-        replyToId = null;
-        replyPanel.style.display = 'none';
-    }
-    function toggleSilent() {
-        isSilent = !isSilent;
-        silentBtn.style.color = isSilent ? '#0088cc' : '#ccc';
-    }
+    function setReply(id, text) { replyToId = id; replyPanel.style.display = 'block'; replyTextPreview.textContent = text || "Медиафайл"; msgInput.focus(); }
+    function cancelReply() { replyToId = null; replyPanel.style.display = 'none'; }
+    function toggleSilent() { isSilent = !isSilent; silentBtn.style.color = isSilent ? '#0088cc' : '#ccc'; }
 
     async function handleFileSelect(input) {
-        const file = input.files[0];
-        if (!file || !activeChatId) return;
-        const formData = new FormData();
-        formData.append("file", file);
+        const file = input.files[0]; if(!file || !activeChatId) return;
+        const fd = new FormData(); fd.append("file", file);
         try {
-            const res = await fetch('/upload', { method: 'POST', body: formData });
-            if (!res.ok) throw new Error("Upload failed");
-            const data = await res.json();
-            socket.send(JSON.stringify({ type: "message", text: "", file_url: data.file_url, sender: currentUser, reply_to_id: replyToId, is_silent: isSilent }));
+            const res = await fetch('/upload', { method:'POST', body:fd });
+            if(!res.ok) throw new Error("Upload failed");
+            const d = await res.json();
+            socket.send(JSON.stringify({ type:"message", text:"", file_url:d.file_url, sender:currentUser, reply_to_id:replyToId, is_silent:isSilent, chat_id:activeChatId }));
             cancelReply();
-        } catch (err) { alert("Ошибка отправки: " + err.message); }
+        } catch(err) { alert("Ошибка: " + err.message); }
         input.value = '';
     }
 
     async function toggleRecording() {
-        if (!isRecording) {
+        if(!isRecording) {
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
-                audioChunks = [];
-                mediaRecorder.ondataavailable = event => { audioChunks.push(event.data); };
+                const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+                mediaRecorder = new MediaRecorder(stream); audioChunks = [];
+                mediaRecorder.ondataavailable = ev => audioChunks.push(ev.data);
                 mediaRecorder.onstop = () => {
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                    const audioFile = new File([audioBlob], "voice.webm", { type: "audio/webm" });
-                    handleFileSelect({ files: [audioFile] });
+                    const blob = new Blob(audioChunks, {type:'audio/webm'});
+                    handleFileSelect({files:[new File([blob], "voice.webm", {type:"audio/webm"})]});
                 };
-                mediaRecorder.start();
-                isRecording = true;
-                micBtn.classList.add('recording');
-            } catch (err) { alert("Нет доступа к микрофону"); }
-        } else {
-            mediaRecorder.stop();
-            isRecording = false;
-            micBtn.classList.remove('recording');
-        }
+                mediaRecorder.start(); isRecording = true; micBtn.classList.add('recording');
+            } catch(err) { alert("Нет доступа к микрофону"); }
+        } else { mediaRecorder.stop(); isRecording = false; micBtn.classList.remove('recording'); }
     }
 
     function renderMessage(msg) {
-        if (!msg.text && !msg.file_url && msg.type !== 'reaction_update') return;
-        const placeholder = messagesContainer.querySelector('.no-chat-selected');
-        if (placeholder) placeholder.remove();
-
-        const wrapper = document.createElement('div');
-        wrapper.className = `msg-wrapper ${msg.sender === currentUser ? 'my' : 'other'}`;
-        if (msg.id) wrapper.id = `msg-${msg.id}`;
-
-        const bubble = document.createElement('div');
-        bubble.className = 'msg-bubble';
-        bubble.ondblclick = () => { if (msg.id && socket) socket.send(JSON.stringify({ type: "reaction", msg_id: msg.id, emoji: "❤️", sender: currentUser })); };
-        bubble.oncontextmenu = (e) => { e.preventDefault(); setReply(msg.id, msg.text); };
-
-        if (msg.reply_to_id && msg.reply_text) {
-            const replyDiv = document.createElement('div');
-            replyDiv.style.cssText = "font-size:0.85em; color:#0088cc; margin-bottom:4px; border-left:2px solid #0088cc; padding-left:5px; cursor:pointer;";
-            replyDiv.innerHTML = `<i class="fas fa-reply"></i> ${msg.reply_text.substring(0, 30)}...`;
-            replyDiv.onclick = () => { const t = document.getElementById(`msg-${msg.reply_to_id}`); if(t) t.scrollIntoView({behavior:"smooth", block:"center"}); };
-            bubble.appendChild(replyDiv);
+        if(!msg.text && !msg.file_url && msg.type !== 'reaction_update') return;
+        const ph = messagesContainer.querySelector('.no-chat-selected'); if(ph) ph.remove();
+        const wrap = document.createElement('div');
+        wrap.className = `msg-wrapper ${msg.sender === currentUser ? 'my' : 'other'}`;
+        if(msg.id) { wrap.id = `msg-${msg.id}`; messageElements[msg.id] = null; }
+        const bubble = document.createElement('div'); bubble.className = 'msg-bubble';
+        bubble.ondblclick = () => { if(msg.id && socket) socket.send(JSON.stringify({type:"reaction", msg_id:msg.id, emoji:"❤️", sender:currentUser})); };
+        bubble.oncontextmenu = e => { e.preventDefault(); setReply(msg.id, msg.text); };
+        if(msg.reply_to_id && msg.reply_text) {
+            const rd = document.createElement('div');
+            rd.style.cssText = "font-size:0.85em; color:#0088cc; margin-bottom:4px; border-left:2px solid #0088cc; padding-left:5px; cursor:pointer;";
+            rd.innerHTML = `<i class="fas fa-reply"></i> ${msg.reply_text.substring(0,30)}...`;
+            rd.onclick = () => { const t = document.getElementById(`msg-${msg.reply_to_id}`); if(t) t.scrollIntoView({behavior:"smooth", block:"center"}); };
+            bubble.appendChild(rd);
         }
-
-        if (msg.text) { const p = document.createElement('div'); p.textContent = msg.text; bubble.appendChild(p); }
-        if (msg.file_url) {
-            let fullUrl = msg.file_url.startsWith('/') ? window.location.origin + msg.file_url : msg.file_url;
-            if (fullUrl.match(/\.(webm|mp3|wav)$/i)) {
-                const audio = document.createElement('audio'); audio.src = fullUrl; audio.controls = true; audio.className = 'msg-audio'; bubble.appendChild(audio);
-            } else {
-                const img = document.createElement('img'); img.src = fullUrl; img.className = 'msg-img'; img.onclick = () => window.open(fullUrl, '_blank'); bubble.appendChild(img);
+        if(msg.text) { const p = document.createElement('div'); p.textContent = msg.text; bubble.appendChild(p); }
+        if(msg.file_url) {
+            let url = msg.file_url.startsWith('/') ? window.location.origin + msg.file_url : msg.file_url;
+            if(url.match(/\.(webm|mp3|wav)$/i)) { const a = document.createElement('audio'); a.src = url; a.controls = true; a.className = 'msg-audio'; bubble.appendChild(a); }
+            else { const img = document.createElement('img'); img.src = url; img.className = 'msg-img'; img.onclick = () => window.open(url, '_blank'); bubble.appendChild(img); }
+        }
+        const meta = document.createElement('div'); meta.style.cssText = "display:flex; justify-content:flex-end; align-items:center; gap:5px; margin-top:4px;";
+        if(msg.is_silent) { const i = document.createElement('i'); i.className = 'fas fa-bell-slash'; i.style.cssText = "font-size:0.7em; color:#999;"; meta.appendChild(i); }
+        const time = document.createElement('span'); time.className = 'msg-time'; time.textContent = msg.time; meta.appendChild(time);
+        if(msg.sender === currentUser && msg.id) {
+            const st = document.createElement('span');
+            // Если сообщение уже прочитано — двойная галочка, иначе одинарная
+            // Если сообщение от меня — проверяю, прочитал ли его собеседник (msg.is_read из БД)
+            // Если сообщение не от меня — оно всегда "прочитано" для меня визуально, если я в чате
+            const isRead = msg.sender === currentUser ? (readMessageIds.has(msg.id) || msg.is_read) : true;
+            st.className = `msg-status ${isRead ? 'status-read' : 'status-sent'}`;
+            st.innerHTML = isRead ? '&#10003;&#10003;' : '&#10003;';
+            meta.appendChild(st);
+            messageElements[msg.id] = st;
+            // Если чат активен и сообщение новое — сразу помечаем как прочитанное
+            if(activeChatId && !readMessageIds.has(msg.id)) {
+                markMessagesAsRead([msg.id]);
+                sendReadReceipt(activeChatId, [msg.id]);
             }
         }
-
-        const metaDiv = document.createElement('div');
-        metaDiv.style.cssText = "display:flex; justify-content:flex-end; align-items:center; gap:5px; margin-top:4px;";
-        if (msg.is_silent) { const i = document.createElement('i'); i.className = 'fas fa-bell-slash'; i.style.cssText = "font-size:0.7em; color:#999;"; metaDiv.appendChild(i); }
-        const time = document.createElement('span'); time.className = 'msg-time'; time.textContent = msg.time; metaDiv.appendChild(time);
-
-        if (msg.sender === currentUser && msg.id) {
-            const statusSpan = document.createElement('span');
-            statusSpan.className = `msg-status ${msg.is_read ? 'status-read' : 'status-sent'}`;
-            statusSpan.innerHTML = msg.is_read ? '&#10003;&#10003;' : '&#10003;';
-            metaDiv.appendChild(statusSpan);
-            messageElements[msg.id] = statusSpan;
-        }
-        bubble.appendChild(metaDiv);
-        wrapper.appendChild(bubble);
-        messagesContainer.appendChild(wrapper);
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        bubble.appendChild(meta); wrap.appendChild(bubble); messagesContainer.appendChild(wrap); messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
 
     function updateMessageReaction(msgId, sender, emoji) {
         const w = document.getElementById(`msg-${msgId}`);
-        if (w) {
-            let badge = w.querySelector('.reaction-badge');
-            if (!badge) { badge = document.createElement('div'); badge.className = 'reaction-badge'; w.querySelector('.msg-bubble').appendChild(badge); }
-            badge.textContent = emoji; badge.style.display = 'block';
-        }
+        if(w) { let b = w.querySelector('.reaction-badge'); if(!b) { b = document.createElement('div'); b.className = 'reaction-badge'; w.querySelector('.msg-bubble').appendChild(b); } b.textContent = emoji; b.style.display = 'block'; }
     }
-    function markAllAsReadUI() {
-        for (const id in messageElements) {
-            const el = messageElements[id];
-            if (el) { el.className = 'msg-status status-read'; el.innerHTML = '&#10003;&#10003;'; }
-        }
-    }
+    function markAllAsReadUI() { for(const id in messageElements) { const el = messageElements[id]; if(el) { el.className = 'msg-status status-read'; el.innerHTML = '&#10003;&#10003;'; readMessageIds.add(parseInt(id)); } } }
     function logout() { localStorage.clear(); location.reload(); }
+
+    // Отправка read_receipt при скролле до конца чата
+    messagesContainer.addEventListener('scroll', () => {
+        if(activeChatId && socket && socket.readyState === WebSocket.OPEN) {
+            const nearBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 100;
+            if(nearBottom) {
+                // Находим все непрочитанные сообщения в этом чате
+                const unread = Object.keys(messageElements).filter(id => !readMessageIds.has(parseInt(id))).map(Number);
+                if(unread.length) {
+                    markMessagesAsRead(unread);
+                    sendReadReceipt(activeChatId, unread);
+                }
+            }
+        }
+    });
 </script>
 </body>
 </html>
